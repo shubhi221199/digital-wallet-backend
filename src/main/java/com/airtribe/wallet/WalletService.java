@@ -113,12 +113,17 @@ public class WalletService {
                 """, (rs, rowNum) -> new RiskRule(rs.getLong("risk_rule_id"), rs.getString("rule_name"),
                 rs.getString("action")), request.amountPaise());
         String status = firedRules.stream().anyMatch(rule -> "HOLD".equals(rule.action())) ? "HELD" : "POSTED";
+        jdbc.queryForObject("SELECT set_config('wallet.actor', ?, true)", String.class, "user:" + userId);
         Long transferId = jdbc.queryForObject("""
                 INSERT INTO transfers(transfer_type, status, source_account_id, target_account_id, amount_paise, note)
                 VALUES (?, ?, ?, ?, ?, ?) RETURNING transfer_id
                 """, Long.class, type, status, debitAccount, creditAccount, request.amountPaise(), request.note());
         for (RiskRule rule : firedRules) {
-            jdbc.update("INSERT INTO risk_flags(transfer_id, risk_rule_id) VALUES (?, ?)", transferId, rule.id());
+            jdbc.update("""
+                    INSERT INTO risk_flags(transfer_id, risk_rule_id, explanation, label)
+                    VALUES (?, ?, ?, 'review')
+                    """, transferId, rule.id(), "The transfer matched the configured rule '" + rule.name()
+                    + "'. Review recent account activity before deciding.");
         }
         if (status.equals("HELD")) {
             return jsonResponse(202, Map.of("transferId", transferId, "status", status, "amountPaise", request.amountPaise()));
@@ -241,22 +246,59 @@ public class WalletService {
             Long runId = jdbc.queryForObject("INSERT INTO reconciliation_runs(started_at, status) VALUES (now(), 'RUNNING') RETURNING reconciliation_run_id", Long.class);
             int issues = 0;
             issues += recordIssues(runId, "transfer_balance", """
-                    SELECT transfer_id, '0', SUM(CASE WHEN direction = 'DEBIT' THEN amount_paise ELSE -amount_paise END)::text
-                    FROM ledger_entries GROUP BY transfer_id HAVING SUM(CASE WHEN direction = 'DEBIT' THEN amount_paise ELSE -amount_paise END) <> 0
+                    SELECT t.transfer_id,
+                           'at least two entries; debit = credit = transfer amount ' || t.amount_paise,
+                           'entries=' || COUNT(l.ledger_entry_id)
+                               || ', debit=' || COALESCE(SUM(l.amount_paise) FILTER (WHERE l.direction = 'DEBIT'), 0)
+                               || ', credit=' || COALESCE(SUM(l.amount_paise) FILTER (WHERE l.direction = 'CREDIT'), 0)
+                    FROM transfers t LEFT JOIN ledger_entries l ON l.transfer_id = t.transfer_id
+                    WHERE t.status = 'POSTED'
+                    GROUP BY t.transfer_id, t.amount_paise
+                    HAVING COUNT(l.ledger_entry_id) < 2
+                        OR COALESCE(SUM(l.amount_paise) FILTER (WHERE l.direction = 'DEBIT'), 0)
+                           <> COALESCE(SUM(l.amount_paise) FILTER (WHERE l.direction = 'CREDIT'), 0)
+                        OR COALESCE(SUM(l.amount_paise) FILTER (WHERE l.direction = 'DEBIT'), 0) <> t.amount_paise
+                    """);
+            issues += recordIssues(runId, "global_balance", """
+                    SELECT 0,
+                           COALESCE(SUM(amount_paise) FILTER (WHERE direction = 'DEBIT'), 0)::text,
+                           COALESCE(SUM(amount_paise) FILTER (WHERE direction = 'CREDIT'), 0)::text
+                    FROM ledger_entries
+                    HAVING COALESCE(SUM(amount_paise) FILTER (WHERE direction = 'DEBIT'), 0)
+                           <> COALESCE(SUM(amount_paise) FILTER (WHERE direction = 'CREDIT'), 0)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM transfers t LEFT JOIN ledger_entries l ON l.transfer_id = t.transfer_id
+                           WHERE t.status = 'POSTED'
+                           GROUP BY t.transfer_id, t.amount_paise
+                           HAVING COUNT(l.ledger_entry_id) < 2
+                               OR COALESCE(SUM(l.amount_paise) FILTER (WHERE l.direction = 'DEBIT'), 0)
+                                  <> COALESCE(SUM(l.amount_paise) FILTER (WHERE l.direction = 'CREDIT'), 0)
+                               OR COALESCE(SUM(l.amount_paise) FILTER (WHERE l.direction = 'DEBIT'), 0) <> t.amount_paise
+                       )
                     """);
             issues += recordIssues(runId, "stored_balance", """
                     SELECT a.account_id, COALESCE(SUM(CASE WHEN l.direction = 'CREDIT' THEN l.amount_paise ELSE -l.amount_paise END), 0)::text, a.balance_paise::text
                     FROM accounts a LEFT JOIN ledger_entries l ON l.account_id = a.account_id
                     GROUP BY a.account_id, a.balance_paise
                     HAVING a.balance_paise <> COALESCE(SUM(CASE WHEN l.direction = 'CREDIT' THEN l.amount_paise ELSE -l.amount_paise END), 0)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM transfers t JOIN ledger_entries broken ON broken.transfer_id = t.transfer_id
+                           WHERE t.status = 'POSTED' AND broken.account_id = a.account_id
+                           GROUP BY t.transfer_id, t.amount_paise
+                           HAVING COUNT(broken.ledger_entry_id) < 2
+                               OR SUM(broken.amount_paise) FILTER (WHERE broken.direction = 'DEBIT')
+                                  <> SUM(broken.amount_paise) FILTER (WHERE broken.direction = 'CREDIT')
+                               OR SUM(broken.amount_paise) FILTER (WHERE broken.direction = 'DEBIT') <> t.amount_paise
+                       )
                     """);
             issues += recordIssues(runId, "overdraft", """
-                    SELECT a.account_id, '>= 0', a.balance_paise::text FROM accounts a
-                    WHERE a.owner_user_id IS NOT NULL AND a.balance_paise < 0
-                    """);
-            issues += recordIssues(runId, "transfer_without_entries", """
-                    SELECT t.transfer_id, 'at least 2', COUNT(l.ledger_entry_id)::text FROM transfers t LEFT JOIN ledger_entries l ON l.transfer_id = t.transfer_id
-                    GROUP BY t.transfer_id HAVING COUNT(l.ledger_entry_id) < 2 AND t.status = 'POSTED'
+                    SELECT a.account_id, '>= 0', computed.balance_paise::text
+                    FROM accounts a
+                    CROSS JOIN LATERAL (
+                        SELECT COALESCE(SUM(CASE WHEN l.direction = 'CREDIT' THEN l.amount_paise ELSE -l.amount_paise END), 0) AS balance_paise
+                        FROM ledger_entries l WHERE l.account_id = a.account_id
+                    ) computed
+                    WHERE a.owner_user_id IS NOT NULL AND computed.balance_paise < 0
                     """);
             issues += recordIssues(runId, "orphan_ledger", """
                     SELECT l.ledger_entry_id, 'transfer exists', 'missing transfer' FROM ledger_entries l LEFT JOIN transfers t ON t.transfer_id = l.transfer_id
@@ -286,7 +328,8 @@ public class WalletService {
                     && balances.getOrDefault(original.targetAccountId(), 0L) < original.amountPaise()) {
                 throw new WalletException("INSUFFICIENT_FUNDS", "Counterparty wallet cannot fund this reversal", HttpStatus.UNPROCESSABLE_ENTITY);
             }
-            Long reversalId = jdbc.queryForObject("""
+                jdbc.queryForObject("SELECT set_config('wallet.actor', ?, true)", String.class, "user:" + userId);
+                Long reversalId = jdbc.queryForObject("""
                     INSERT INTO transfers(transfer_type, status, source_account_id, target_account_id, amount_paise, reverses_transfer_id)
                     VALUES ('REVERSAL', 'POSTED', ?, ?, ?, ?) RETURNING transfer_id
                     """, Long.class, original.targetAccountId(), original.sourceAccountId(), original.amountPaise(), originalTransferId);

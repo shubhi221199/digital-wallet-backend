@@ -18,6 +18,7 @@
 | Currency | Not a separate table | INR is the only supported currency; the check constraint prevents unsupported values. |
 | Statement | Not a separate table | It is a paginated query over ledger entries and transfers. |
 | Fraud explanation | `risk_flags` columns | Explanation and label belong to the corresponding fired rule. |
+| Fee policy | Not configured | The fee-revenue account and `FEE` transfer type are present, but no fee is charged until a pricing policy is selected. |
 
 ## Cardinalities
 
@@ -29,7 +30,7 @@
 | Transfer to source/target account | M:1 twice | `transfers.source_account_id`, `transfers.target_account_id` |
 | Transfer to reversal | 1:0..1 | `transfers.reverses_transfer_id` with a partial unique index |
 | User to idempotency key | 1:M | `idempotency_keys.user_id`, unique with `key` |
-| Transfer to status audit | 1:M | `transfer_status_audit.transfer_id` |
+| Transfer to status audit | 1:M | `transfer_status_audit.transfer_id`; initial status and each later change are recorded |
 | Transfer to risk flag | 1:M | `risk_flags.transfer_id` |
 | Risk rule to risk flag | 1:M | `risk_flags.risk_rule_id` |
 | Reconciliation run to issue | 1:M | `reconciliation_issues.reconciliation_run_id` |
@@ -53,7 +54,7 @@ erDiagram
 
 ## Money and Constraints
 
-All amounts are positive `BIGINT` paise. Direction is a separate `DEBIT`/`CREDIT` field, so aggregation never relies on floating-point values. Transfers in `POSTED` state must have at least two balanced ledger lines at commit; a deferred constraint trigger permits the transfer and its entries to be inserted in one SQL transaction. A trigger rejects ledger updates and deletes. `accounts.balance_paise` is materialized: a conditional lock-protected transfer updates it atomically with the immutable entries. The database check on user-owned account balances prevents negative values; system accounts are allowed to go negative.
+All amounts are positive `BIGINT` paise. Direction is a separate `DEBIT`/`CREDIT` field, so aggregation never relies on floating-point values. Transfers in `POSTED` state must have at least two ledger lines whose debit and credit totals match each other and the transfer amount at commit; a deferred constraint trigger permits the transfer and its entries to be inserted in one SQL transaction. A trigger rejects ledger updates and deletes. `accounts.balance_paise` is materialized: a conditional lock-protected transfer updates it atomically with the immutable entries. The database check on user-owned account balances prevents negative values; system accounts are allowed to go negative.
 
 Email and phone are externally supplied contact data. They have uniqueness constraints because the current product assumes one account per contact value, but they can change and are not identifiers, so generated `user_id` remains the primary key.
 
@@ -61,4 +62,4 @@ Email and phone are externally supplied contact data. They have uniqueness const
 
 ## Indexes
 
-The statement index is `(account_id, created_at DESC, ledger_entry_id DESC)`. Transfer history has source and target indexes ordered by creation time. The unique `(user_id, key)` constraint supports idempotency lookup. Foreign keys and reconciliation support indexes are present for transfer and account joins. Each extra index adds write and storage cost; these cover the hot read paths and foreign-key checks in this assignment.
+The statement index is `(account_id, created_at DESC, ledger_entry_id DESC)`. Transfer history has source and target indexes ordered by creation time. The partial risk-rule index `risk_rules_active_threshold_idx` supports the active threshold lookup before a transfer. The unique `(user_id, key)` constraint supports idempotency lookup. Foreign keys and reconciliation support indexes are present for transfer and account joins. Each extra index adds write and storage cost; these cover the hot read paths and foreign-key checks in this assignment.

@@ -1,3 +1,13 @@
+ALTER TABLE job_locks
+    ADD COLUMN job_lock_id BIGINT GENERATED ALWAYS AS IDENTITY;
+ALTER TABLE job_locks DROP CONSTRAINT job_locks_pkey;
+ALTER TABLE job_locks ADD CONSTRAINT job_locks_pkey PRIMARY KEY (job_lock_id);
+ALTER TABLE job_locks ADD CONSTRAINT job_locks_job_name_key UNIQUE (job_name);
+
+CREATE INDEX risk_rules_active_threshold_idx
+    ON risk_rules(minimum_amount_paise DESC, risk_rule_id)
+    WHERE active;
+
 CREATE OR REPLACE FUNCTION audit_transfer_status() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
